@@ -1,8 +1,7 @@
 use clap::Parser;
 use rayon::prelude::*;
 use rustix::fs::{statat, AtFlags, FileType, Mode};
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -48,29 +47,41 @@ impl PartialOrd for FileEntry {
     }
 }
 
-/// Per-thread min-heap for tracking top-N candidates
-struct TopNHeap {
-    heap: BinaryHeap<Reverse<FileEntry>>,
+/// Shared sorted top-N tracker using VecDeque
+/// Maintains sorted order: largest files at tail, smallest at head
+struct TopNTracker {
+    deque: VecDeque<FileEntry>,
     capacity: usize,
 }
 
-impl TopNHeap {
+impl TopNTracker {
     fn new(capacity: usize) -> Self {
         Self {
-            heap: BinaryHeap::with_capacity(capacity + 1),
+            deque: VecDeque::with_capacity(capacity),
             capacity,
         }
     }
 
+    /// Insert entry into sorted position, maintaining top-N invariant
     fn insert(&mut self, entry: FileEntry) {
-        self.heap.push(Reverse(entry));
-        if self.heap.len() > self.capacity {
-            self.heap.pop();
+        // If deque is not full, or this entry is larger than the smallest, insert it
+        if self.deque.len() < self.capacity || entry > *self.deque.front().unwrap() {
+            // Binary search to find insertion position (deque is sorted ascending)
+            let pos = self.deque.binary_search(&entry).unwrap_or_else(|e| e);
+            self.deque.insert(pos, entry);
+
+            // If we exceeded capacity, remove smallest (head)
+            if self.deque.len() > self.capacity {
+                self.deque.pop_front();
+            }
         }
     }
 
     fn into_vec(self) -> Vec<FileEntry> {
-        self.heap.into_iter().map(|Reverse(e)| e).collect()
+        // Convert to Vec and reverse to get descending order
+        let mut vec: Vec<_> = self.deque.into_iter().collect();
+        vec.reverse();
+        vec
     }
 }
 
@@ -92,7 +103,7 @@ struct DirEntry {
 /// classify each with a single statx() call
 fn scan_directory(
     dir_path: &Path,
-    top_n: &mut TopNHeap,
+    top_n: &Mutex<TopNTracker>,
     stats: &mut ScanStats,
     subdirs: &mut Vec<PathBuf>,
 ) -> io::Result<()> {
@@ -140,7 +151,8 @@ fn scan_directory(
         match metadata {
             EntryMetadata::RegularFile { size } => {
                 stats.files_scanned += 1;
-                top_n.insert(FileEntry {
+                // Lock only for insertion, minimizing contention
+                top_n.lock().unwrap().insert(FileEntry {
                     size,
                     path: entry.path,
                 });
@@ -197,10 +209,10 @@ fn classify_entry(parent: &Path, name: &str) -> io::Result<EntryMetadata> {
     Ok(result)
 }
 
-/// Parallel directory traversal using level-by-level BFS
+/// Parallel directory traversal using level-by-level BFS with shared top-N tracker
 fn parallel_scan(root: PathBuf, capacity: usize) -> (Vec<FileEntry>, ScanStats) {
     let global_stats = Mutex::new(ScanStats::default());
-    let thread_heaps = Mutex::new(Vec::<TopNHeap>::new());
+    let global_top_n = Mutex::new(TopNTracker::new(capacity));
 
     // Work queue of directories to process
     let mut work_queue = vec![root];
@@ -210,15 +222,15 @@ fn parallel_scan(root: PathBuf, capacity: usize) -> (Vec<FileEntry>, ScanStats) 
         let next_queue = Mutex::new(Vec::new());
 
         // Process current level of directories in parallel
-        let results: Vec<_> = work_queue
+        let stats_vec: Vec<_> = work_queue
             .par_iter()
             .map_init(
-                || (TopNHeap::new(capacity), ScanStats::default()),
-                |(top_n, stats), dir| {
+                || ScanStats::default(),
+                |stats, dir| {
                     let mut subdirs = Vec::new();
 
-                    // Scan this directory atomically
-                    if let Err(_) = scan_directory(dir, top_n, stats, &mut subdirs) {
+                    // Scan this directory atomically, inserting directly into shared top-N
+                    if let Err(_) = scan_directory(dir, &global_top_n, stats, &mut subdirs) {
                         stats.errors += 1;
                     }
 
@@ -227,52 +239,28 @@ fn parallel_scan(root: PathBuf, capacity: usize) -> (Vec<FileEntry>, ScanStats) 
                         next_queue.lock().unwrap().extend(subdirs);
                     }
 
-                    // Return ownership of heap and stats
-                    (std::mem::replace(top_n, TopNHeap::new(capacity)),
-                     std::mem::take(stats))
+                    std::mem::take(stats)
                 },
             )
             .collect();
 
-        // Collect per-thread heaps and stats
-        for (heap, stats) in results {
-            thread_heaps.lock().unwrap().push(heap);
-            let mut global = global_stats.lock().unwrap();
+        // Aggregate stats
+        let mut global = global_stats.lock().unwrap();
+        for stats in stats_vec {
             global.files_scanned += stats.files_scanned;
             global.dirs_scanned += stats.dirs_scanned;
             global.errors += stats.errors;
         }
+        drop(global);
 
         // Move to next level
         work_queue = next_queue.into_inner().unwrap();
     }
 
-    // Merge all thread heaps deterministically
-    let heaps = thread_heaps.into_inner().unwrap();
-    let merged = merge_heaps(heaps, capacity);
+    let results = global_top_n.into_inner().unwrap().into_vec();
     let stats = global_stats.into_inner().unwrap();
 
-    (merged, stats)
-}
-
-/// Merge per-thread heaps into final top-N with total ordering
-fn merge_heaps(heaps: Vec<TopNHeap>, capacity: usize) -> Vec<FileEntry> {
-    let mut final_heap = TopNHeap::new(capacity);
-
-    for heap in heaps {
-        for entry in heap.into_vec() {
-            final_heap.insert(entry);
-        }
-    }
-
-    let mut results = final_heap.into_vec();
-    // Sort in descending order (largest first) with path as tiebreaker
-    results.sort_by(|a, b| {
-        b.size
-            .cmp(&a.size)
-            .then_with(|| a.path.cmp(&b.path))
-    });
-    results
+    (results, stats)
 }
 
 /// Format file size in human-readable format
